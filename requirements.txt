@@ -4,7 +4,11 @@ openpyxl
 requests
 google-auth
 google-auth-oauthlib
-google-api-python-client
 gspread
 plotly
 numpy
+requests
+PyJWT
+cryptography
+google-auth
+google_api_python_client
