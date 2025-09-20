@@ -26,14 +26,17 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
-# Our Auth0 login + allowlist (from auth.py)
 from auth import auth_gate, logout
+import streamlit as st
+
+
 
 st.set_page_config(page_title="GTSBE Prop Points Hub", layout="wide")
 user = auth_gate()
 st.sidebar.markdown(f"**Signed in as:** {user['email']}")
-st.sidebar.button("Logout", on_click=logout)
+st.sidebar.button("Logout", key="btn_sidebar_logout", on_click=logout)
+
+
 
 # ---------- Google auth helpers (Service Account) ----------
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
@@ -41,10 +44,22 @@ DRIVE_RO_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"  # if you ever need write
 
 def get_google_creds() -> Credentials:
-    """Build service-account credentials from st.secrets."""
     sa = dict(st.secrets["GOOGLE_SERVICE_ACCOUNT"])
+
+    # Normalize private_key: convert literal "\n" into real newlines if needed
+    pk = sa.get("private_key", "")
+    if "\\n" in pk and "\n" not in pk.split("\\n")[0]:  # crude but effective
+        sa["private_key"] = pk.replace("\\n", "\n")
+
+    # Optional sanity checks (won't leak contents)
+    if not sa["private_key"].startswith("-----BEGIN PRIVATE KEY-----"):
+        raise RuntimeError("Service account private_key is not a valid PEM (missing BEGIN header).")
+    if not sa["private_key"].strip().endswith("END PRIVATE KEY-----"):
+        raise RuntimeError("Service account private_key is not a valid PEM (missing END footer).")
+
     scopes = [SHEETS_SCOPE, DRIVE_RO_SCOPE]
     return Credentials.from_service_account_info(sa, scopes=scopes)
+
 
 def get_gspread_client(creds: Credentials) -> gspread.Client:
     return gspread.authorize(creds)
@@ -52,6 +67,48 @@ def get_gspread_client(creds: Credentials) -> gspread.Client:
 def open_spreadsheet(gc: gspread.Client, ref: str):
     """Open by URL or by key."""
     return gc.open_by_url(ref) if str(ref).startswith("http") else gc.open_by_key(ref)
+
+def _read_csv_or_list(val) -> list[str]:
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return [str(x).strip() for x in val if str(x).strip()]
+    # CSV string
+    return [s.strip() for s in str(val).split(",") if s.strip()]
+
+def get_allowlist(key: str) -> set[str]:
+    """
+    Reads an allowlist from secrets. Accepts either:
+      - Top-level: PROP_ALLOWED_EMAILS = "a@x,b@y"  (or a TOML array)
+      - Nested:   [access] PROP_ALLOWED_EMAILS = [...]
+    Returns all entries lowercased.
+    """
+    import streamlit as st
+    val = st.secrets.get(key)
+    if val is None:
+        val = st.secrets.get("access", {}).get(key) or st.secrets.get("ACCESS", {}).get(key)
+    items = _read_csv_or_list(val)
+    return {s.lower() for s in items}
+
+def email_is_allowed(email: str, allowlist: set[str]) -> bool:
+    """
+    Rules:
+      - '*' allows everyone
+      - exact email match
+      - domain rule: entries that start with '@' allow any address ending with that domain
+    """
+    if not allowlist:
+        return False
+    em = (email or "").lower().strip()
+    if "*" in allowlist:
+        return True
+    if em in allowlist:
+        return True
+    for entry in allowlist:
+        if entry.startswith("@") and em.endswith(entry):
+            return True
+    return False
+
 
 # ---------- Auth gate (blocks until logged in & allowed) ----------
 user = auth_gate()  # -> {"email","name","sub"}
@@ -98,6 +155,16 @@ if st.session_state.page == "menu":
 # ---------- PROP POINTS ----------
 elif st.session_state.page == "prop_points":
     st.markdown("### Prop Points Calculator")
+
+    # === PAGE-LEVEL ACCESS CONTROL ===
+    prop_allow = get_allowlist("PROP_ALLOWED_EMAILS")  # reads top-level or [access] block
+    user_email = (user.get("email") or "").lower()
+    if not email_is_allowed(user_email, prop_allow):
+        st.error("Access denied: this tool is restricted to the Prop Points team.")
+        st.caption("If you believe this is an error, ask an admin to add your email to PROP_ALLOWED_EMAILS in secrets.")
+        st.button("⬅︎ Back to menu", key="back_prop_denied", on_click=lambda: go("menu"))
+        st.stop()
+    # =================================
 
     # Helpers local to this page
     def pick(df: pd.DataFrame, *cands):
@@ -358,9 +425,8 @@ elif st.session_state.page == "event_points":
     )
 
     st.caption(
-        f"After downloading **{DEFAULT_JSON_FILENAME}**, upload it to the Drive folder that contains your MAIN FORM spreadsheet.\n"
-        "Tip: In Google Drive, open the MAIN FORM file, click the folder icon by its title to open the parent folder, "
-        "then upload the JSON there."
+        f"After downloading **{DEFAULT_JSON_FILENAME}**, upload it to the Drive folder in the CPC folder \n"
+        "after downloading reupload the JSON file and ensure that the name is event_points.json."
     )
 
     st.button("⬅︎ Back to menu", on_click=lambda: go("menu"))
