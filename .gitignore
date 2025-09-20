@@ -1,1 +1,15 @@
+# at repo root .gitignore
 .streamlit/secrets.toml
+token.json
+secrets.toml
+*.json
+.venv/
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+token.json
+secrets.toml
+*.json
+.venv/
+__pycache__/
+*.pyc
