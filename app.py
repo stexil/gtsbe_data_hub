@@ -31,6 +31,9 @@ from googleapiclient.http import MediaIoBaseDownload
 from auth import auth_gate, logout
 
 st.set_page_config(page_title="GTSBE Prop Points Hub", layout="wide")
+user = auth_gate()
+st.sidebar.markdown(f"**Signed in as:** {user['email']}")
+st.sidebar.button("Logout", on_click=logout)
 
 # ---------- Google auth helpers (Service Account) ----------
 SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"

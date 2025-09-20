@@ -12,3 +12,5 @@ PyJWT
 cryptography
 google-auth
 google_api_python_client
+streamlit[auth]>=1.42
+Authlib>=1.3.2
