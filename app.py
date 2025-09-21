@@ -65,6 +65,9 @@ def _find_email_col(df: pd.DataFrame) -> str | None:
             return c
     return None
 
+def go(page_name: str):
+    st.session_state.page = page_name
+
 def get_excluded_gtids(key: str = "PROP_EXCLUDED_GTIDS") -> set[str]:
     val = st.secrets.get(key)
     if val is None:
@@ -144,7 +147,7 @@ if "page" not in st.session_state:
 
 def go(page_name: str):
     st.session_state.page = page_name
-    st.rerun()
+    #st.rerun()
 
 # ---------- MENU ----------
 if st.session_state.page == "menu":
@@ -171,8 +174,8 @@ if st.session_state.page == "menu":
             st.button("Open", key="tile_blank1", on_click=lambda: go("blank1"))
     with col4:
         with st.container(border=True):
-            st.markdown("### (Blank)")
-            st.write("Reserved for a future tool.")
+            st.markdown("### Member Attendance Lookup")
+            st.write("Find Attendance History for any member that has signed in")
             st.button("Open", key="tile_blank2", on_click=lambda: go("blank2"))
 
 # ---------- PROP POINTS ----------
@@ -655,11 +658,38 @@ elif st.session_state.page == "event_points":
 
     st.button("⬅︎ Back to menu", on_click=lambda: go("menu"))
 
-# ---------- ACTIVITY REPORT (date/time filter, untouched rows) ----------
+# ---------- ACTIVITY REPORT (date/time + optional event type filter) ----------
 elif st.session_state.page == "blank1":
     st.markdown("### Activity Report Attendance")
 
-    st.caption("Filter attendance by date and time window.")
+    EVENT_COL = "What type of meeting is this?"
+
+    @st.cache_data(ttl=600)
+    def _load_attendance_df():
+        creds = get_google_creds()
+        gc = get_gspread_client(creds)
+        sheet_ref = st.secrets.get("GOOGLE_SHEETS_ID") or st.secrets.get("GOOGLE_SHEETS_URL")
+        if not sheet_ref:
+            raise RuntimeError("Missing GOOGLE_SHEETS_ID or GOOGLE_SHEETS_URL in secrets.")
+        sh = open_spreadsheet(gc, sheet_ref)
+        ws_name = st.secrets.get("GOOGLE_SHEETS_WORKSHEET")
+        ws = sh.worksheet(ws_name) if ws_name else sh.get_worksheet(0)
+        records = ws.get_all_records()
+        return pd.DataFrame(records)
+
+    # Preload unique event types for the selector (if the column exists)
+    try:
+        _df_for_options = _load_attendance_df()
+        if not _df_for_options.empty and EVENT_COL in _df_for_options.columns:
+            unique_event_types = sorted(
+                [s for s in _df_for_options[EVENT_COL].astype(str).str.strip().unique() if s]
+            )
+        else:
+            unique_event_types = []
+    except Exception:
+        unique_event_types = []
+
+    st.caption("Filter attendance by date, time window, and (optionally) event type.")
     colA, colB, colC = st.columns([1,1,1])
     with colA:
         the_date = st.date_input("Date")
@@ -668,26 +698,25 @@ elif st.session_state.page == "blank1":
     with colC:
         end_t   = st.time_input("End time", value=dtime(23, 59))
 
+    # Event Type filter (default = All)
+    if unique_event_types:
+        event_type_choice = st.selectbox(
+            "Event type (optional)", 
+            options=["All"] + unique_event_types, 
+            index=0,
+            help=f"Values come from the '{EVENT_COL}' column."
+        )
+    else:
+        event_type_choice = "All"
+        st.caption(f"*No event type selector shown: '{EVENT_COL}' not found or sheet empty.*")
+
     run = st.button("Run report", type="primary")
     st.button("⬅︎ Back to menu", on_click=lambda: go("menu"))
 
     if run:
         with st.spinner("Loading attendance…"):
             try:
-                creds = get_google_creds()
-                gc = get_gspread_client(creds)
-
-                sheet_ref = st.secrets.get("GOOGLE_SHEETS_ID") or st.secrets.get("GOOGLE_SHEETS_URL")
-                if not sheet_ref:
-                    raise RuntimeError("Missing GOOGLE_SHEETS_ID or GOOGLE_SHEETS_URL in secrets.")
-
-                sh = open_spreadsheet(gc, sheet_ref)
-                ws_name = st.secrets.get("GOOGLE_SHEETS_WORKSHEET")
-                ws = sh.worksheet(ws_name) if ws_name else sh.get_worksheet(0)
-
-                records = ws.get_all_records()
-                df = pd.DataFrame(records)
-
+                df = _load_attendance_df()
                 if df.empty:
                     st.info("Sheet connected, but no rows found.")
                     st.stop()
@@ -700,53 +729,42 @@ elif st.session_state.page == "blank1":
                     st.stop()
                 ts_col = possible_cols[0]
 
-                ts = pd.to_datetime(df[ts_col], errors="coerce", infer_datetime_format=True)
+                ts = pd.to_datetime(df[ts_col], errors="coerce")  # no infer_datetime_format (deprecated)
                 start_dt = datetime.combine(the_date, start_t)
                 end_dt   = datetime.combine(the_date, end_t)
 
                 mask = (ts >= start_dt) & (ts <= end_dt)
+
+                # Apply event type filter if selected and column exists
+                if event_type_choice != "All" and EVENT_COL in df.columns:
+                    mask &= (df[EVENT_COL].astype(str).str.strip() == event_type_choice)
+
                 view = df.loc[mask].copy()
 
-                st.success(f"Found {len(view)} records between {start_dt:%Y-%m-%d %H:%M} and {end_dt:%Y-%m-%d %H:%M}.")
+                # Status + table
+                extra = "" if event_type_choice == "All" else f" | Event type: {event_type_choice}"
+                st.success(
+                    f"Found {len(view)} records between {start_dt:%Y-%m-%d %H:%M} and {end_dt:%Y-%m-%d %H:%M}{extra}."
+                )
                 st.dataframe(view, use_container_width=True)
 
-
-
-
-
-
-
-
-
-
+                # Download CSV
                 csv_bytes = view.to_csv(index=False).encode("utf-8")
                 st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="activity_report.csv", mime="text/csv")
-                
 
+                # Email list (if an email column exists)
                 email_col = _find_email_col(view)
-
                 if email_col:
-                    # Clean, dedupe, sort
                     emails_series = (
-                        view[email_col]
-                        .astype(str)
-                        .str.strip()
-                        .str.lower()
+                        view[email_col].astype(str).str.strip().str.lower()
                     )
-                    # basic sanity: keep things that look like emails
                     emails_series = emails_series[emails_series.str.contains("@")]
-
                     unique_emails = sorted({e for e in emails_series.tolist() if e})
                     email_blob = ", ".join(unique_emails)
 
                     st.subheader("Email list for this window")
                     st.caption("Use the copy button or download as a .txt file.")
-
-                    st.text_area("Comma-separated emails", value=email_blob, height=120, key="emails_blob", help="You can also Ctrl/Cmd+A, then copy.")
-
-                    c1, c2 = st.columns([1, 1])
-
-            
+                    st.text_area("Comma-separated emails", value=email_blob, height=120, key="emails_blob")
                     st.download_button(
                         "⬇️ Download emails.txt",
                         data=email_blob.encode("utf-8"),
@@ -765,25 +783,23 @@ elif st.session_state.page == "blank1":
                     nsbe_count = nsbe_numeric.notna().sum()
                     st.markdown(f"**Registered NSBE Members (numeric NSBE ID):** {nsbe_count}")
 
-                # Pies
+                # Pie helpers (unchanged)
                 def pie_counts_from_column(view_df, colname, title, key, top_n=None, outside_if_pct_below=0.08):
                     if colname not in view_df.columns:
                         st.info(f"No '{colname}' column found for breakdown.")
                         return
                     s = view_df[colname].astype(str).str.strip()
-                    counts = (
-                        s[s != ""].value_counts()
-                         .rename_axis("label")
-                         .reset_index(name="count")
-                    )
+                    counts = s[s != ""].value_counts().rename_axis("label").reset_index(name="count")
                     if counts.empty:
                         st.info(f"No non-empty values in '{colname}'.")
                         return
                     if top_n and len(counts) > top_n:
                         head = counts.iloc[:top_n].copy()
                         other_val = counts.iloc[top_n:]["count"].sum()
-                        counts = pd.concat([head, pd.DataFrame([{"label": "Other", "count": other_val}])],
-                                           ignore_index=True)
+                        counts = pd.concat(
+                            [head, pd.DataFrame([{"label": "Other", "count": other_val}])],
+                            ignore_index=True
+                        )
                     total = counts["count"].sum()
                     percents = counts["count"] / total
                     textpos = ["inside" if p >= outside_if_pct_below else "outside" for p in percents]
@@ -805,7 +821,6 @@ elif st.session_state.page == "blank1":
                 dues_cols = [c for c in view.columns if "due" in c.lower()]
                 if dues_cols:
                     dues_col = dues_cols[0]
-
                     def map_dues(v):
                         if pd.isna(v): return None
                         s = str(v).strip().lower()
@@ -813,12 +828,8 @@ elif st.session_state.page == "blank1":
                         if s in {"no","n","false","0","unpaid"} or "not paid" in s: return "Not Paid"
                         if "paid" in s and "not" not in s and "un" not in s: return "Paid"
                         return None
-
                     status = view[dues_col].apply(map_dues).dropna()
-                    dues_counts = (
-                        status.value_counts()
-                              .rename_axis("label").reset_index(name="count")
-                    )
+                    dues_counts = status.value_counts().rename_axis("label").reset_index(name="count")
                     if not dues_counts.empty:
                         fig = px.pie(dues_counts, names="label", values="count", title="Dues Paid Status")
                         fig.update_traces(
@@ -836,11 +847,206 @@ elif st.session_state.page == "blank1":
                 st.error("Failed to generate report.")
                 st.code(traceback.format_exc())
 
+
 # ---------- BLANK ----------
+# ---------- MEMBER ATTENDANCE LOOKUP ----------
 elif st.session_state.page == "blank2":
-    st.markdown("### Activity Report Attendance Generator.")
-    st.info("Use this to generate your attendance for your specific event. Just insert the day and time range.")
+    st.markdown("### Member Attendance Lookup")
+    st.info("Find all events a member attended (by GTID or name), shown in chronological order.")
     st.button("⬅︎ Back to menu", on_click=lambda: go("menu"))
+
+    import pandas as pd
+    import numpy as np
+    from datetime import datetime, time as dtime
+
+    @st.cache_data(ttl=600)
+    def load_attendance() -> pd.DataFrame:
+        """Load the same attendance sheet used elsewhere."""
+        creds = get_google_creds()
+        gc = get_gspread_client(creds)
+
+        sheet_ref = st.secrets.get("GOOGLE_SHEETS_ID") or st.secrets.get("GOOGLE_SHEETS_URL")
+        if not sheet_ref:
+            raise RuntimeError("Missing GOOGLE_SHEETS_ID or GOOGLE_SHEETS_URL in secrets.")
+        sh = open_spreadsheet(gc, sheet_ref)
+
+        ws_name = st.secrets.get("GOOGLE_SHEETS_WORKSHEET")
+        ws = sh.worksheet(ws_name) if ws_name else sh.get_worksheet(0)
+
+        records = ws.get_all_records()
+        return pd.DataFrame(records)
+
+    def _pick(df: pd.DataFrame, *cands: str) -> str | None:
+        lowmap = {c.lower(): c for c in df.columns}
+        for name in cands:
+            if name in df.columns:
+                return name
+            if name.lower() in lowmap:
+                return lowmap[name.lower()]
+        return None
+
+    def _normalize_name(s: str) -> str:
+        return " ".join(str(s).strip().lower().split())
+
+    def _coerce_ts(s):
+        try:
+            return pd.to_datetime(s, errors="coerce")
+        except Exception:
+            return pd.NaT
+
+    # ------- UI -------
+    with st.form("member_lookup"):
+        mode = st.radio("Search by", ["GTID", "First & Last Name"], horizontal=True)
+
+        c1, c2, c3 = st.columns([1,1,1])
+        gtid, first, last = "", "", ""
+        if mode == "GTID":
+            with c1:
+                gtid = st.text_input("GTID", placeholder="e.g., 903123456")
+        else:
+            with c1:
+                first = st.text_input("First name", placeholder="e.g., Jordan")
+            with c2:
+                last  = st.text_input("Last name",  placeholder="e.g., Davis")
+
+        with c3:
+            filter_dates = st.checkbox("Filter by date range?", value=False)
+
+        d1, d2 = st.columns([1,1])
+        start_date = end_date = None
+        if filter_dates:
+            with d1:
+                start_date = st.date_input("Start date", value=None)
+            with d2:
+                end_date   = st.date_input("End date", value=None)
+
+        submitted = st.form_submit_button("Search", type="primary")
+
+    if submitted:
+        with st.spinner("Loading attendance…"):
+            try:
+                df = load_attendance()
+            except Exception as e:
+                st.error("Could not connect to Google Sheets.")
+                st.code(str(e))
+                st.stop()
+
+        if df.empty:
+            st.info("Sheet connected, but no rows found.")
+            st.stop()
+
+        # ---- Identify key columns (robust to header differences)
+        ts_col = None
+        for c in df.columns:
+            cl = c.lower().strip()
+            if "time" in cl or "date" in cl:
+                ts_col = c
+                break
+        if not ts_col:
+            st.error("Could not find a timestamp/date column in the sheet.")
+            st.code(f"Columns: {list(df.columns)}")
+            st.stop()
+
+        gtid_col = _pick(df, "GTID", "Id", "Student Id", "Gtid")
+        first_col = _pick(df, "First Name", "First", "Given Name")
+        last_col  = _pick(df, "Last Name", "Last", "Surname", "Family Name")
+        event_col = _pick(df, "Event", "What type of meeting is this?", "Meeting Type", "Event Name")
+
+        if not event_col:
+            st.error("Could not find an event/meeting column (e.g., 'Event' or 'What type of meeting is this?').")
+            st.code(f"Columns: {list(df.columns)}")
+            st.stop()
+
+        # ---- Clean types
+        view = df.copy()
+        view["__ts"] = view[ts_col].apply(_coerce_ts)
+
+        # Name normalization for matching
+        if first_col and last_col:
+            view["__first_n"] = view[first_col].map(_normalize_name)
+            view["__last_n"]  = view[last_col].map(_normalize_name)
+            view["__full_n"]  = (view["__first_n"] + " " + view["__last_n"]).str.strip()
+        else:
+            view["__first_n"] = ""
+            view["__last_n"]  = ""
+            view["__full_n"]  = ""
+
+        # ---- Build filter
+        mask = pd.Series(True, index=view.index)
+
+        if mode == "GTID":
+            q = (gtid or "").strip()
+            if not q:
+                st.error("Please enter a GTID.")
+                st.stop()
+            if not gtid_col:
+                st.error("No GTID-like column found in the sheet.")
+                st.stop()
+            mask &= (view[gtid_col].astype(str).str.strip() == q)
+        else:
+            fn = _normalize_name(first)
+            ln = _normalize_name(last)
+            if not fn or not ln:
+                st.error("Please enter both first and last name.")
+                st.stop()
+            mask &= (view["__first_n"] == fn) & (view["__last_n"] == ln)
+
+        if filter_dates and (start_date or end_date):
+            if start_date:
+                mask &= (view["__ts"] >= pd.Timestamp(datetime.combine(start_date, dtime.min)))
+            if end_date:
+                mask &= (view["__ts"] <= pd.Timestamp(datetime.combine(end_date, dtime.max)))
+
+        result = view.loc[mask].copy()
+
+        # ---- Shape output (chronological)
+        if result.empty:
+            who = gtid if mode == "GTID" else f"{first} {last}"
+            st.info(f"No attendance records found for **{who}**.")
+        else:
+            # Choose nice display columns if present
+            display_cols = []
+            if ts_col: display_cols.append(("__ts", "Date/Time"))
+            if event_col: display_cols.append((event_col, "Event"))
+            if gtid_col: display_cols.append((gtid_col, "GTID"))
+            if first_col: display_cols.append((first_col, "First Name"))
+            if last_col:  display_cols.append((last_col, "Last Name"))
+
+            tidy = result[[c for c, _ in display_cols]].copy()
+            tidy = tidy.sort_values("__ts", ascending=True)
+            tidy.rename(columns={c: label for c, label in display_cols}, inplace=True)
+
+            who = ""
+            if mode == "GTID":
+                who = gtid
+            else:
+                # Use the cleaned name if available, else the typed name
+                if first_col and last_col and not tidy.empty:
+                    who = f"{tidy['First Name'].iloc[0]} {tidy['Last Name'].iloc[0]}".strip()
+                else:
+                    who = f"{first} {last}".strip()
+
+            st.success(f"Found **{len(tidy)}** record(s) for **{who}**.")
+            st.dataframe(tidy, use_container_width=True, hide_index=True)
+
+            # Quick summary: counts per event
+            with st.expander("Summary by event"):
+                summary = (
+                    tidy.groupby("Event", as_index=False)
+                        .agg(Occurrences=("Event", "count"))
+                        .sort_values(["Occurrences", "Event"], ascending=[False, True])
+                )
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+
+            # Download CSV
+            st.download_button(
+                "⬇️ Download results as CSV",
+                data=tidy.to_csv(index=False).encode("utf-8"),
+                file_name=f"attendance_{who.replace(' ','_')}.csv",
+                mime="text/csv",
+                key="dl_member_attendance_csv",
+            )
+
 
 # ---------- Footer ----------
 st.markdown("---")
@@ -848,7 +1054,7 @@ col_left, col_center, col_right = st.columns([3, 2, 3])
 with col_center:
     st.markdown("<div style='text-align: center;'>", unsafe_allow_html=True)
     if st.button("🔁 Refresh page", use_container_width=True):
-        st.rerun()
+        go()
     if st.button("🚪 Log out", use_container_width=True):
         logout()
     st.markdown("</div>", unsafe_allow_html=True)
