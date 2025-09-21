@@ -31,10 +31,8 @@ import streamlit as st
 
 
 
-st.set_page_config(page_title="GTSBE Prop Points Hub", layout="wide")
+st.set_page_config(page_title="GTSBE Analytics Hub", layout="wide")
 user = auth_gate()
-st.sidebar.markdown(f"**Signed in as:** {user['email']}")
-st.sidebar.button("Logout", key="btn_sidebar_logout", on_click=logout)
 
 
 
@@ -59,6 +57,31 @@ def get_google_creds() -> Credentials:
 
     scopes = [SHEETS_SCOPE, DRIVE_RO_SCOPE]
     return Credentials.from_service_account_info(sa, scopes=scopes)
+
+def _find_email_col(df: pd.DataFrame) -> str | None:
+    for c in df.columns:
+        cl = c.strip().lower()
+        if "email" in cl:
+            return c
+    return None
+
+def get_excluded_gtids(key: str = "PROP_EXCLUDED_GTIDS") -> set[str]:
+    val = st.secrets.get(key)
+    if val is None:
+        return set()
+    if isinstance(val, list):
+        vals = [str(x).strip() for x in val if str(x).strip()]
+    else:
+        vals = [s.strip() for s in str(val).split(",") if s.strip()]
+    return set(vals)
+
+def find_email_col(df: pd.DataFrame) -> str | None:
+    candidates = {"email", "email address", "gt email", "gtmail"}
+    lowmap = {c.lower(): c for c in df.columns}
+    for c in lowmap:
+        if c.strip().lower() in candidates or "email" in c.strip().lower():
+            return lowmap[c]
+    return None
 
 
 def get_gspread_client(creds: Credentials) -> gspread.Client:
@@ -313,6 +336,207 @@ elif st.session_state.page == "prop_points":
     else:
         st.info("No calculated results to show yet.")
 
+
+        # ---------- Pricing (Lodging & Housing) ----------
+    st.markdown("### Pricing (Lodging & Housing)")
+
+    def get_excluded_gtids(key: str = "PROP_EXCLUDED_GTIDS") -> set[str]:
+        val = st.secrets.get(key)
+        if val is None:
+            return set()
+        if isinstance(val, list):
+            vals = [str(x).strip() for x in val if str(x).strip()]
+        else:
+            vals = [s.strip() for s in str(val).split(",") if s.strip()]
+        return set(vals)
+
+    def find_email_col(df: pd.DataFrame) -> str | None:
+        candidates = {"email", "email address", "gt email", "gtmail"}
+        lowmap = {c.lower(): c for c in df.columns}
+        for c in lowmap:
+            if c.strip().lower() in candidates or "email" in c.strip().lower():
+                return lowmap[c]
+        return None
+
+    if isinstance(res, pd.DataFrame) and not res.empty:
+        # Inputs
+        cA, cB, cC = st.columns([1,1,1])
+        with cA:
+            min_price = st.number_input("Min price (X)", min_value=0.0, value=50.0, step=5.0)
+        with cB:
+            max_price = st.number_input("Max price (Y)", min_value=0.0, value=170.0, step=5.0)
+        with cC:
+            method = st.selectbox(
+                "Mapping",
+                ["Linear", "Normal-like (tanh)", "Quantile (rank-linear)"],
+                index=2,
+                help=(
+                    "All are monotonic (higher points ⇒ lower price). "
+                    "Quantile uses ECDF/ranks (robust to skew; median → (X+Y)/2)."
+                ),
+            )
+
+        # Pull email column from the original attendance df (not the aggregated one)
+        email_col = find_email_col(df)
+
+        # Merge emails into the aggregated points result
+        email_frame = pd.DataFrame()
+        if email_col:
+            keep_cols = [c for c in (gtid_col, email_col) if c]
+            email_frame = df[keep_cols].dropna(subset=[gtid_col]).drop_duplicates(subset=[gtid_col])
+            email_frame = email_frame.rename(columns={gtid_col: "GTID", email_col: "Email"})
+        else:
+            email_frame["GTID"] = res["GTID"]
+            email_frame["Email"] = ""
+
+        merged = (
+            res.merge(email_frame, on="GTID", how="left")
+            .loc[:, ["GTID", "First Name", "Last Name", "Email", "Points"]]
+        )
+
+        # Exclusions from distribution
+        excluded_gtids = get_excluded_gtids("PROP_EXCLUDED_GTIDS")
+        merged["Excluded"] = merged["GTID"].astype(str).isin(excluded_gtids)
+
+        # Compute mapping only on non-excluded
+        working = merged.loc[~merged["Excluded"]].copy()
+
+        def price_from_weight(w: np.ndarray) -> np.ndarray:
+            # Price = Y - w*(Y - X).  w in [0,1], higher w -> lower price.
+            return (max_price - w * (max_price - min_price)).astype(float)
+
+        # ---- Compute weights w in [0,1] for each row in 'working'
+        if working.empty:
+            st.info("All rows are excluded by PROP_EXCLUDED_GTIDS. Nothing to price.")
+            out_priced = merged.copy()
+            out_priced["Expected Price"] = np.nan
+        else:
+            n = len(working)
+            pts = working["Points"].to_numpy(dtype=float)
+
+            if method == "Linear" or method.startswith("Normal-like"):
+                pmin, pmax = float(np.min(pts)), float(np.max(pts))
+                if pmax == pmin:
+                    norm = np.ones(n)
+                else:
+                    norm = (pts - pmin) / (pmax - pmin)
+                w = norm.copy()
+                if method.startswith("Normal-like"):
+                    alpha = 2.0  # steepness
+                    w = 0.5 + 0.5 * np.tanh(alpha * (norm - 0.5))
+
+            elif method == "Quantile (rank-linear)":
+                # Rank-based weights: w = (rank-1)/(n-1), average ranks for ties.
+                # Guarantees median maps to (X+Y)/2; robust to skew & outliers.
+                if n == 1:
+                    w = np.ones(1)
+                else:
+                    import pandas as _pd
+                    ranks = _pd.Series(pts).rank(method="average", ascending=True)
+                    w = (ranks - 1) / (n - 1)
+                    w = w.to_numpy(dtype=float)
+
+            prices = np.round(price_from_weight(w), 2)
+            working["Expected Price"] = prices
+
+            # Stitch back (excluded get blank price)
+            out_priced = merged.copy()
+            out_priced = out_priced.merge(
+                working[["GTID", "Expected Price"]],
+                on="GTID", how="left"
+            )
+
+        # Show / export
+        show_excluded = st.checkbox("Show excluded rows", value=True)
+        show_df = out_priced if show_excluded else out_priced.loc[~out_priced["Excluded"]]
+
+        st.markdown("#### Pricing Preview")
+        st.dataframe(
+            show_df.sort_values(["Excluded","Expected Price","Points","GTID"],
+                                ascending=[True, True, False, True]),
+            use_container_width=True
+        )
+
+        export_df = out_priced.loc[~out_priced["Excluded"], ["GTID","First Name","Last Name","Email","Points","Expected Price"]]
+        st.download_button(
+            "⬇️ Download pricing CSV",
+            data=export_df.to_csv(index=False).encode("utf-8"),
+            file_name="prop_points_pricing.csv",
+            mime="text/csv",
+            key="dl_pricing_csv",
+        )
+
+        st.caption(
+            "Mapping notes: Linear and Quantile both send the median to (X+Y)/2. "
+            "Quantile uses ranks (ECDF), so it’s less sensitive to outliers."
+        )
+
+        # ---------- Individual price checker ----------
+        st.markdown("#### Individual price checker")
+
+        colL, colR = st.columns([1,1])
+        with colL:
+            gtid_lookup = st.text_input("GTID (optional)", help="Enter a GTID from the table to fetch their points.")
+        with colR:
+            manual_points = st.number_input("Or enter points directly (optional)", min_value=0.0, value=0.0, step=1.0)
+
+        # Resolve the points to test
+        test_points = None
+        test_excluded = False
+        if gtid_lookup.strip():
+            row = merged.loc[merged["GTID"].astype(str) == gtid_lookup.strip()]
+            if not row.empty:
+                test_points = float(row.iloc[0]["Points"])
+                test_excluded = bool(row.iloc[0]["Excluded"])
+            else:
+                st.info("GTID not found in current results; using manual points if provided.")
+
+        if test_points is None and manual_points > 0:
+            test_points = float(manual_points)
+
+        # Compute expected price for the test point using the current mapping
+        if test_points is not None:
+            if test_excluded:
+                st.warning("This GTID is excluded by PROP_EXCLUDED_GTIDS, so no price is computed.")
+            else:
+                # We need the current working distribution for ranks / normalization
+                vals = working["Points"].to_numpy(dtype=float)
+                m = len(vals)
+
+                if method == "Linear" or method.startswith("Normal-like"):
+                    pmin, pmax = float(np.min(vals)), float(np.max(vals))
+                    if pmax == pmin:
+                        norm_tp = 1.0
+                    else:
+                        norm_tp = (test_points - pmin) / (pmax - pmin)
+                    norm_tp = float(np.clip(norm_tp, 0.0, 1.0))
+                    w_tp = norm_tp
+                    if method.startswith("Normal-like"):
+                        alpha = 2.0
+                        w_tp = 0.5 + 0.5 * float(np.tanh(alpha * (norm_tp - 0.5)))
+
+                elif method == "Quantile (rank-linear)":
+                    # ECDF with average for ties: use left/right indices
+                    s = np.sort(vals)
+                    if m == 1:
+                        r = 1.0
+                    else:
+                        left = int(np.searchsorted(s, test_points, side="left"))
+                        right = int(np.searchsorted(s, test_points, side="right"))
+                        avg_pos = 0.5 * (left + right)  # average tie position
+                        # Convert 0..(m-1) scale:
+                        r = (avg_pos - 1) / (m - 1)
+                        r = float(np.clip(r, 0.0, 1.0))
+                    w_tp = r
+
+                expected_price = round(float(max_price - w_tp * (max_price - min_price)), 2)
+                st.success(f"Expected price for {test_points:g} points ({method}): **${expected_price}**")
+
+    else:
+        st.info("Compute points first to enable pricing.")
+
+
+
     st.button("⬅︎ Back to menu", on_click=lambda: go("menu"))
 
 # ---------- EVENT POINTS (edit/JSON) ----------
@@ -486,8 +710,50 @@ elif st.session_state.page == "blank1":
                 st.success(f"Found {len(view)} records between {start_dt:%Y-%m-%d %H:%M} and {end_dt:%Y-%m-%d %H:%M}.")
                 st.dataframe(view, use_container_width=True)
 
+
+
+
+
+
+
+
+
+
                 csv_bytes = view.to_csv(index=False).encode("utf-8")
                 st.download_button("⬇️ Download CSV", data=csv_bytes, file_name="activity_report.csv", mime="text/csv")
+                
+
+                email_col = _find_email_col(view)
+
+                if email_col:
+                    # Clean, dedupe, sort
+                    emails_series = (
+                        view[email_col]
+                        .astype(str)
+                        .str.strip()
+                        .str.lower()
+                    )
+                    # basic sanity: keep things that look like emails
+                    emails_series = emails_series[emails_series.str.contains("@")]
+
+                    unique_emails = sorted({e for e in emails_series.tolist() if e})
+                    email_blob = ", ".join(unique_emails)
+
+                    st.subheader("Email list for this window")
+                    st.caption("Use the copy button or download as a .txt file.")
+
+                    st.text_area("Comma-separated emails", value=email_blob, height=120, key="emails_blob", help="You can also Ctrl/Cmd+A, then copy.")
+
+                    c1, c2 = st.columns([1, 1])
+
+            
+                    st.download_button(
+                        "⬇️ Download emails.txt",
+                        data=email_blob.encode("utf-8"),
+                        file_name="emails.txt",
+                        mime="text/plain",
+                        key="dl_emails",
+                    )
 
                 # NSBE members count (if present)
                 nsbe_cols = [c for c in df.columns if c.strip().lower() == "nsbe id"]
